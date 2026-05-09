@@ -48,10 +48,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 
 	function updateStatus(ctx: ExtensionContext): void {
 		// Footer status
-		if (executionMode && todoItems.length > 0) {
-			const completed = todoItems.filter((t) => t.completed).length;
-			ctx.ui.setStatus("plan-mode", ctx.ui.theme.fg("accent", `📋 ${completed}/${todoItems.length}`));
-		} else if (planModeEnabled) {
+		if (planModeEnabled) {
 			ctx.ui.setStatus("plan-mode", ctx.ui.theme.fg("warning", "⏸ plan"));
 		} else {
 			ctx.ui.setStatus("plan-mode", undefined);
@@ -59,11 +56,13 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 
 		// Widget showing todo list
 		if (executionMode && todoItems.length > 0) {
-			const lines = todoItems.map((item) => {
+			const currentIndex = todoItems.findIndex((t) => !t.completed);
+			const lines = todoItems.map((item, index) => {
 				if (item.completed) {
-					return (
-						ctx.ui.theme.fg("success", "☑ ") + ctx.ui.theme.fg("muted", ctx.ui.theme.strikethrough(item.text))
-					);
+					return `☑ ${ctx.ui.theme.fg("muted", ctx.ui.theme.strikethrough(item.text))}`;
+				}
+				if (index === currentIndex) {
+					return `${ctx.ui.theme.fg("warning", "☑ ")}${item.text}`;
 				}
 				return `${ctx.ui.theme.fg("muted", "☐ ")}${item.text}`;
 			});
