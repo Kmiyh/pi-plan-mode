@@ -128,24 +128,52 @@ export function cleanStepText(text: string): string {
 
 export function extractTodoItems(message: string): TodoItem[] {
 	const items: TodoItem[] = [];
-	const headerMatch = message.match(/\*{0,2}Plan:\*{0,2}\s*\n/i);
-	if (!headerMatch) return items;
 
-	const planSection = message.slice(message.indexOf(headerMatch[0]) + headerMatch[0].length);
-	const numberedPattern = /^\s*(\d+)[.)]\s+\*{0,2}([^*\n]+)/gm;
+	// Flexible header: "Plan:", "**Plan:**", "## Plan", "# Plan", "Plan\n"
+	// Allows markdown heading, optional colon, optional bold markers
+	const headerPattern = /(?:^|\n)\s*\*{0,2}(?:#{1,4}\s+)?Plan:?\*{0,2}[\s.:—–]*\n/im;
+	const headerMatch = message.match(headerPattern);
 
-	for (const match of planSection.matchAll(numberedPattern)) {
-		const text = match[2]
-			.trim()
-			.replace(/\*{1,2}$/, "")
-			.trim();
-		if (text.length > 5 && !text.startsWith("`") && !text.startsWith("/") && !text.startsWith("-")) {
-			const cleaned = cleanStepText(text);
-			if (cleaned.length > 3) {
-				items.push({ step: items.length + 1, text: cleaned, completed: false });
-			}
+	// Extract the section after the header, or use the whole message as fallback
+	let planSection: string;
+	if (headerMatch) {
+		planSection = message.slice(message.indexOf(headerMatch[0]) + headerMatch[0].length);
+	} else {
+		// No header — try the entire message (guarded by minimum item count below)
+		planSection = message;
+	}
+
+	// Match numbered items: "1.", "1)", "1 -", "1:"
+	// Capture the full line after the number+delimiter
+	const numberedPattern = /^\s*(\d+)\s*[.)\-:]\s+(.+)$/gm;
+
+	const originalNumbers: number[] = [];
+	let match: RegExpExecArray | null;
+	while ((match = numberedPattern.exec(planSection)) !== null) {
+		originalNumbers.push(Number(match[1]));
+
+		let rawText = match[2].trim();
+		// Strip bold/italic markers from step text
+		rawText = rawText.replace(/\*{1,2}/g, "");
+		// Strip inline code markers
+		rawText = rawText.replace(/`([^`]+)`/g, "$1");
+
+		if (rawText.length < 3) continue;
+
+		const cleaned = cleanStepText(rawText);
+		if (cleaned.length > 2) {
+			items.push({ step: items.length + 1, text: cleaned, completed: false });
 		}
 	}
+
+	// Without a Plan header, require at least 3 numbered items starting from
+	// number 1 to avoid false positives from random numbered references
+	if (!headerMatch && items.length > 0) {
+		if (items.length < 3 || originalNumbers[0] !== 1) {
+			return [];
+		}
+	}
+
 	return items;
 }
 
