@@ -40,12 +40,6 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	let executionMode = false;
 	let todoItems: TodoItem[] = [];
 
-	pi.registerFlag("plan", {
-		description: "Start in plan mode (read-only exploration)",
-		type: "boolean",
-		default: false,
-	});
-
 	function updateStatus(ctx: ExtensionContext): void {
 		// Footer status
 		if (planModeEnabled) {
@@ -112,7 +106,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.registerShortcut(Key.ctrlAlt("p"), {
+	pi.registerShortcut(Key.ctrlShift("m"), {
 		description: "Toggle plan mode",
 		handler: async (ctx) => togglePlanMode(ctx),
 	});
@@ -288,10 +282,6 @@ After completing a step, include a [DONE:n] tag in your response.`,
 
 	// Restore state on session start/resume
 	pi.on("session_start", async (_event, ctx) => {
-		if (pi.getFlag("plan") === true) {
-			planModeEnabled = true;
-		}
-
 		const entries = ctx.sessionManager.getEntries();
 
 		// Restore persisted state
