@@ -7,16 +7,27 @@
  * Features:
  * - /plan command or Ctrl+Alt+P to toggle
  * - Bash restricted to allowlisted read-only commands
- * - Extracts numbered plan steps from "Plan:" sections
+ * - Analyzes task, finds ambiguities, asks clarifying questions
+ * - Extracts plan steps with titles and descriptions
+ * - Creates plan.md file on approval (user can edit)
  * - [DONE:n] markers to complete steps during execution
- * - Progress tracking widget during execution
+ * - Progress tracking widget and plan.md updates during execution
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
-import { extractTodoItems, isSafeCommand, markCompletedSteps, type TodoItem } from "./utils.js";
+import {
+	deletePlanFile,
+	extractTodoItems,
+	isSafeCommand,
+	markCompletedSteps,
+	planFilePath,
+	type TodoItem,
+	updatePlanFile,
+	writePlanFile,
+} from "./utils.js";
 
 // Tools
 const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "questionnaire"];
@@ -34,6 +45,32 @@ function getTextContent(message: AssistantMessage): string {
 		.map((block) => block.text)
 		.join("\n");
 }
+
+const PLAN_MODE_PROMPT = `[PLAN MODE ACTIVE]
+You are in plan mode — a read-only exploration mode for safe code analysis.
+
+Restrictions:
+- You can only use: read, bash, grep, find,_ls, questionnaire
+- You CANNOT use: edit, write (file modifications are disabled)
+- Bash is restricted to an allowlist of read-only commands
+
+## Workflow
+
+1. **Analyze** the task carefully. Identify all ambiguities, missing details, edge cases, and alternative approaches.
+2. **Ask questions** if you found ambiguities. For each question, provide numbered answer options with your recommended default marked with ★.
+3. **Create a plan** after the user answers (or immediately if no questions). Use this exact format:
+
+Plan:
+[1]. [Short descriptive title]
+[Detailed description of what you will do and how]
+
+[2]. [Short descriptive title]
+[Detailed description of what you will do and how]
+
+...
+
+Each step must have a short title on the numbered line and a detailed description below it.
+Do NOT make changes — only analyze and plan.`;
 
 export default function planModeExtension(pi: ExtensionAPI): void {
 	let planModeEnabled = false;
@@ -53,12 +90,12 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			const currentIndex = todoItems.findIndex((t) => !t.completed);
 			const lines = todoItems.map((item, index) => {
 				if (item.completed) {
-					return `☑ ${ctx.ui.theme.fg("muted", ctx.ui.theme.strikethrough(item.text))}`;
+					return `☑ ${ctx.ui.theme.fg("muted", ctx.ui.theme.strikethrough(item.title))}`;
 				}
 				if (index === currentIndex) {
-					return `${ctx.ui.theme.fg("warning", "☑ ")}${item.text}`;
+					return `${ctx.ui.theme.fg("warning", "☑ ")}${item.title}`;
 				}
-				return `${ctx.ui.theme.fg("muted", "☐ ")}${item.text}`;
+				return `${ctx.ui.theme.fg("muted", "☐ ")}${item.title}`;
 			});
 			ctx.ui.setWidget("plan-todos", lines);
 		} else {
@@ -101,7 +138,9 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("No todos. Create a plan first with /plan", "info");
 				return;
 			}
-			const list = todoItems.map((item, i) => `${i + 1}. ${item.completed ? "✓" : "○"} ${item.text}`).join("\n");
+			const list = todoItems
+				.map((item, i) => `${i + 1}. ${item.completed ? "✓" : "○"} ${item.title}`)
+				.join("\n");
 			ctx.ui.notify(`Plan Progress:\n${list}`, "info");
 		},
 	});
@@ -154,25 +193,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			return {
 				message: {
 					customType: "plan-mode-context",
-					content: `[PLAN MODE ACTIVE]
-You are in plan mode - a read-only exploration mode for safe code analysis.
-
-Restrictions:
-- You can only use: read, bash, grep, find, ls, questionnaire
-- You CANNOT use: edit, write (file modifications are disabled)
-- Bash is restricted to an allowlist of read-only commands
-
-Ask clarifying questions using the questionnaire tool.
-Use brave-search skill via bash for web research.
-
-Create a detailed numbered plan under a "Plan:" header:
-
-Plan:
-1. First step description
-2. Second step description
-...
-
-Do NOT attempt to make changes - just describe what you would do.`,
+					content: PLAN_MODE_PROMPT,
 					display: false,
 				},
 			};
@@ -180,7 +201,15 @@ Do NOT attempt to make changes - just describe what you would do.`,
 
 		if (executionMode && todoItems.length > 0) {
 			const remaining = todoItems.filter((t) => !t.completed);
-			const todoList = remaining.map((t) => `${t.step}. ${t.text}`).join("\n");
+			const todoList = remaining
+				.map((t) => {
+					let entry = `[${t.step}]. ${t.title}`;
+					if (t.description) {
+						entry += `\n   ${t.description}`;
+					}
+					return entry;
+				})
+				.join("\n");
 			return {
 				message: {
 					customType: "plan-execution-context",
@@ -205,6 +234,8 @@ After completing a step, include a [DONE:n] tag in your response.`,
 		const text = getTextContent(event.message);
 		if (markCompletedSteps(text, todoItems) > 0) {
 			updateStatus(ctx);
+			// Update plan.md to reflect completion
+			await updatePlanFile(planFilePath(ctx.cwd), todoItems);
 		}
 		persistState();
 	});
@@ -214,7 +245,10 @@ After completing a step, include a [DONE:n] tag in your response.`,
 		// Check if execution is complete
 		if (executionMode && todoItems.length > 0) {
 			if (todoItems.every((t) => t.completed)) {
-				const completedList = todoItems.map((t) => `~~${t.text}~~`).join("\n");
+				// Mark all remaining items as completed in plan.md
+				await updatePlanFile(planFilePath(ctx.cwd), todoItems);
+
+				const completedList = todoItems.map((t) => `~~${t.title}~~`).join("\n");
 				pi.sendMessage(
 					{ customType: "plan-complete", content: `**Plan Complete!** ✓\n\n${completedList}`, display: true },
 					{ triggerTurn: false },
@@ -223,7 +257,7 @@ After completing a step, include a [DONE:n] tag in your response.`,
 				todoItems = [];
 				pi.setActiveTools(NORMAL_MODE_TOOLS);
 				updateStatus(ctx);
-				persistState(); // Save cleared state so resume doesn't restore old execution mode
+				persistState();
 			}
 			return;
 		}
@@ -241,7 +275,15 @@ After completing a step, include a [DONE:n] tag in your response.`,
 
 		// Show plan steps and prompt for next action
 		if (todoItems.length > 0) {
-			const todoListText = todoItems.map((t, i) => `${i + 1}. ☐ ${t.text}`).join("\n");
+			const todoListText = todoItems
+				.map((t) => {
+					let line = `[${t.step}]. ☐ ${t.title}`;
+					if (t.description) {
+						line += `\n    ${t.description}`;
+					}
+					return line;
+				})
+				.join("\n");
 			pi.sendMessage(
 				{
 					customType: "plan-todo-list",
@@ -264,9 +306,19 @@ After completing a step, include a [DONE:n] tag in your response.`,
 			pi.setActiveTools(NORMAL_MODE_TOOLS);
 			updateStatus(ctx);
 
+			// Create plan.md file so the user can review/edit before execution continues
+			if (todoItems.length > 0) {
+				try {
+					await writePlanFile(planFilePath(ctx.cwd), todoItems);
+					ctx.ui.notify(`Plan saved to ${planFilePath(ctx.cwd)}. You can edit it before execution.`, "info");
+				} catch {
+					// If file write fails, continue anyway
+				}
+			}
+
 			const execMessage =
 				todoItems.length > 0
-					? `Execute the plan. Start with: ${todoItems[0].text}`
+					? `Execute the plan. Start with: ${todoItems[0].title}`
 					: "Execute the plan you just created.";
 			pi.sendMessage(
 				{ customType: "plan-mode-execute", content: execMessage, display: true },
@@ -291,15 +343,20 @@ After completing a step, include a [DONE:n] tag in your response.`,
 
 		if (planModeEntry?.data) {
 			planModeEnabled = planModeEntry.data.enabled ?? planModeEnabled;
-			todoItems = planModeEntry.data.todos ?? todoItems;
+			// Backwards compatibility: old entries may have .text instead of .title
+			todoItems =
+				(planModeEntry.data.todos as (TodoItem & { text?: string })[] | undefined)?.map((t) => ({
+					step: t.step,
+					title: t.title ?? t.text ?? `Step ${t.step}`,
+					description: t.description ?? "",
+					completed: t.completed,
+				})) ?? todoItems;
 			executionMode = planModeEntry.data.executing ?? executionMode;
 		}
 
 		// On resume: re-scan messages to rebuild completion state
-		// Only scan messages AFTER the last "plan-mode-execute" to avoid picking up [DONE:n] from previous plans
 		const isResume = planModeEntry !== undefined;
 		if (isResume && executionMode && todoItems.length > 0) {
-			// Find the index of the last plan-mode-execute entry (marks when current execution started)
 			let executeIndex = -1;
 			for (let i = entries.length - 1; i >= 0; i--) {
 				const entry = entries[i] as { type: string; customType?: string };
@@ -309,7 +366,6 @@ After completing a step, include a [DONE:n] tag in your response.`,
 				}
 			}
 
-			// Only scan messages after the execute marker
 			const messages: AssistantMessage[] = [];
 			for (let i = executeIndex + 1; i < entries.length; i++) {
 				const entry = entries[i];
@@ -319,11 +375,21 @@ After completing a step, include a [DONE:n] tag in your response.`,
 			}
 			const allText = messages.map(getTextContent).join("\n");
 			markCompletedSteps(allText, todoItems);
+
+			// Update plan.md with current completion state
+			await updatePlanFile(planFilePath(ctx.cwd), todoItems);
 		}
 
 		if (planModeEnabled) {
 			pi.setActiveTools(PLAN_MODE_TOOLS);
 		}
 		updateStatus(ctx);
+	});
+
+	// Clean up plan.md when plan mode is fully disabled (plan complete or no plan)
+	pi.on("session_shutdown", async (_event, ctx) => {
+		if (!planModeEnabled && !executionMode) {
+			await deletePlanFile(planFilePath(ctx.cwd));
+		}
 	});
 }

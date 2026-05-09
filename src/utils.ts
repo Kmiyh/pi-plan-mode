@@ -3,6 +3,15 @@
  * Extracted for testability.
  */
 
+import { writeFile, readFile, unlink } from "node:fs/promises";
+import { join } from "node:path";
+
+export const PLAN_FILE = "plan.md";
+
+export function planFilePath(cwd: string): string {
+	return join(cwd, PLAN_FILE);
+}
+
 // Destructive commands blocked in plan mode
 const DESTRUCTIVE_PATTERNS = [
 	/\brm\b/i,
@@ -102,14 +111,15 @@ export function isSafeCommand(command: string): boolean {
 
 export interface TodoItem {
 	step: number;
-	text: string;
+	title: string;
+	description: string;
 	completed: boolean;
 }
 
 export function cleanStepText(text: string): string {
 	let cleaned = text
-		.replace(/\*{1,2}([^*]+)\*{1,2}/g, "$1") // Remove bold/italic
-		.replace(/`([^`]+)`/g, "$1") // Remove code
+		.replace(/\*{1,2}/g, "")
+		.replace(/`([^`]+)`/g, "$1")
 		.replace(
 			/^(Use|Run|Execute|Create|Write|Read|Check|Verify|Update|Modify|Add|Remove|Delete|Install)\s+(the\s+)?/i,
 			"",
@@ -120,56 +130,89 @@ export function cleanStepText(text: string): string {
 	if (cleaned.length > 0) {
 		cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 	}
-	if (cleaned.length > 50) {
-		cleaned = `${cleaned.slice(0, 47)}...`;
+	if (cleaned.length > 80) {
+		cleaned = `${cleaned.slice(0, 77)}...`;
 	}
 	return cleaned;
+}
+
+function stripMarkdown(text: string): string {
+	return text
+		.replace(/\*{1,2}/g, "")
+		.replace(/`([^`]+)`/g, "$1");
 }
 
 export function extractTodoItems(message: string): TodoItem[] {
 	const items: TodoItem[] = [];
 
 	// Flexible header: "Plan:", "**Plan:**", "## Plan", "# Plan", "Plan\n"
-	// Allows markdown heading, optional colon, optional bold markers
 	const headerPattern = /(?:^|\n)\s*\*{0,2}(?:#{1,4}\s+)?Plan:?\*{0,2}[\s.:—–]*\n/im;
 	const headerMatch = message.match(headerPattern);
 
-	// Extract the section after the header, or use the whole message as fallback
 	let planSection: string;
 	if (headerMatch) {
 		planSection = message.slice(message.indexOf(headerMatch[0]) + headerMatch[0].length);
 	} else {
-		// No header — try the entire message (guarded by minimum item count below)
 		planSection = message;
 	}
 
-	// Match numbered items: "1.", "1)", "1 -", "1:"
-	// Capture the full line after the number+delimiter
-	const numberedPattern = /^\s*(\d+)\s*[.)\-:]\s+(.+)$/gm;
+	// Parse line by line to capture title + description for each numbered item
+	const lines = planSection.split("\n");
+	const numberedLinePattern = /^\s*(\d+)\s*[.)\-:]\s+(.+)$/;
 
-	const originalNumbers: number[] = [];
-	let match: RegExpExecArray | null;
-	while ((match = numberedPattern.exec(planSection)) !== null) {
-		originalNumbers.push(Number(match[1]));
+	let currentItem: { step: number; title: string; descriptionLines: string[] } | null = null;
 
-		let rawText = match[2].trim();
-		// Strip bold/italic markers from step text
-		rawText = rawText.replace(/\*{1,2}/g, "");
-		// Strip inline code markers
-		rawText = rawText.replace(/`([^`]+)`/g, "$1");
+	for (const line of lines) {
+		const match = line.match(numberedLinePattern);
+		if (match) {
+			// Save previous item
+			if (currentItem) {
+				const title = cleanStepText(stripMarkdown(currentItem.title));
+				const description = currentItem.descriptionLines.map(stripMarkdown).join(" ").trim();
+				if (title.length > 2) {
+					items.push({
+						step: currentItem.step,
+						title,
+						description,
+						completed: false,
+					});
+				}
+			}
 
-		if (rawText.length < 3) continue;
+			let rawTitle = match[2].trim();
+			// Remove surrounding [brackets] from title: "[1]. [Title]" → "Title"
+			rawTitle = rawTitle.replace(/^\[([^\]]+)\]\s*\.?\s*/, "$1");
 
-		const cleaned = cleanStepText(rawText);
-		if (cleaned.length > 2) {
-			items.push({ step: items.length + 1, text: cleaned, completed: false });
+			currentItem = {
+				step: Number(match[1]),
+				title: rawTitle,
+				descriptionLines: [],
+			};
+		} else if (currentItem) {
+			const trimmed = line.trim();
+			if (trimmed) {
+				currentItem.descriptionLines.push(trimmed);
+			}
 		}
 	}
 
-	// Without a Plan header, require at least 3 numbered items starting from
-	// number 1 to avoid false positives from random numbered references
+	// Don't forget the last item
+	if (currentItem) {
+		const title = cleanStepText(stripMarkdown(currentItem.title));
+		const description = currentItem.descriptionLines.map(stripMarkdown).join(" ").trim();
+		if (title.length > 2) {
+			items.push({
+				step: currentItem.step,
+				title,
+				description,
+				completed: false,
+			});
+		}
+	}
+
+	// Without a Plan header, require at least 3 numbered items starting from 1
 	if (!headerMatch && items.length > 0) {
-		if (items.length < 3 || originalNumbers[0] !== 1) {
+		if (items.length < 3 || items[0].step !== 1) {
 			return [];
 		}
 	}
@@ -193,4 +236,47 @@ export function markCompletedSteps(text: string, items: TodoItem[]): number {
 		if (item) item.completed = true;
 	}
 	return doneSteps.length;
+}
+
+export function generatePlanMarkdown(items: TodoItem[]): string {
+	const lines: string[] = ["# Plan", ""];
+
+	for (const item of items) {
+		const status = item.completed ? "✅ Completed" : "⬜ Not started";
+		lines.push(`## [${item.step}]. ${item.title}`);
+		lines.push("");
+		if (item.description) {
+			lines.push(item.description);
+			lines.push("");
+		}
+		lines.push(`**Status:** ${status}`);
+		lines.push("");
+		lines.push("---");
+		lines.push("");
+	}
+
+	return lines.join("\n");
+}
+
+export async function writePlanFile(filePath: string, items: TodoItem[]): Promise<void> {
+	const content = generatePlanMarkdown(items);
+	await writeFile(filePath, content, "utf-8");
+}
+
+export async function updatePlanFile(filePath: string, items: TodoItem[]): Promise<void> {
+	try {
+		// Re-generate and overwrite the entire file
+		const content = generatePlanMarkdown(items);
+		await writeFile(filePath, content, "utf-8");
+	} catch {
+		// File may not exist or be unwritable; ignore
+	}
+}
+
+export async function deletePlanFile(filePath: string): Promise<void> {
+	try {
+		await unlink(filePath);
+	} catch {
+		// File may not exist; ignore
+	}
 }
